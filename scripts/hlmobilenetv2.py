@@ -49,6 +49,8 @@ from hlindex import HolisticIndexBlock, DepthwiseO2OIndexBlock, DepthwiseM2OInde
 from hldecoder import *
 from hlconv import *
 from modelsummary import get_model_summary
+from nrd_trans_stage5 import nrd_trans_stage5
+from mix_transformer import mit_b2, mit_b0
 
 try:
     from urllib import urlretrieve
@@ -550,6 +552,552 @@ class MobileNetV2DeepLabv3Plus(nn.Module):
 
 
 #######################################################################################
+# DeepLabv3+ dilated
+#######################################################################################
+class MobileNetV2DeepLabv3Plus_dilated(nn.Module):
+    def __init__(
+            self,
+            output_stride=16,
+            input_size=321,
+            width_mult=1.,
+            conv_operator='std_conv',
+            decoder_kernel_size=5,
+            apply_aspp=False,
+            freeze_bn=False,
+            sync_bn=False,
+            **kwargs
+    ):
+        super(MobileNetV2DeepLabv3Plus_dilated, self).__init__()
+        self.width_mult = width_mult
+
+        BatchNorm2d = SynchronizedBatchNorm2d if sync_bn else nn.BatchNorm2d
+
+        block = InvertedResidual
+        decoder = DeepLabDecoder
+        aspp = ASPP
+        initial_channel = 32
+        current_stride = 1
+        rate = 1
+        inverted_residual_setting = [
+            # t, p, c, n, s, d
+            [1, initial_channel, 16, 1, 1, 1],
+            [6, 16, 24, 2, 2, 1],
+            [6, 24, 32, 3, 2, 1],
+            [6, 32, 64, 4, 2, 1],
+            [6, 64, 96, 3, 1, 1],
+            [6, 96, 160, 3, 2, 1],
+            [6, 160, 320, 1, 1, 1],
+        ]
+
+        ### encoder ###
+        # building the first layer
+        assert input_size % output_stride == 1
+        initial_channel = int(initial_channel * width_mult)
+        self.layer0 = conv_bn(4, initial_channel, 3, 2, BatchNorm2d)
+        current_stride *= 2
+        # building bottleneck layers
+        for i, setting in enumerate(inverted_residual_setting):
+            s = setting[4]
+            if current_stride == output_stride:
+                inverted_residual_setting[i][4] = 1  # change stride
+                rate *= s
+                inverted_residual_setting[i][5] = rate
+            else:
+                current_stride *= s
+        self.layer1 = self._build_layer(block, inverted_residual_setting[0], BatchNorm2d)
+        self.layer2 = self._build_layer(block, inverted_residual_setting[1], BatchNorm2d, downsample=True)
+        self.layer3 = self._build_layer(block, inverted_residual_setting[2], BatchNorm2d, downsample=True)
+        self.layer4 = self._build_layer(block, inverted_residual_setting[3], BatchNorm2d, downsample=True)
+        self.layer5 = self._build_layer(block, inverted_residual_setting[4], BatchNorm2d)
+        self.layer6 = self._build_layer(block, inverted_residual_setting[5], BatchNorm2d, downsample=False)
+        self.layer7 = self._build_layer(block, inverted_residual_setting[6], BatchNorm2d)
+
+        # freeze encoder batch norm layers
+        if freeze_bn:
+            self.freeze_bn()
+
+        ### context aggregation ###
+        self.dconv_pp = aspp(320, 256, output_stride=output_stride, batch_norm=BatchNorm2d)
+
+        ### decoder ###
+        self.decoder = decoder(conv_operator, decoder_kernel_size, batch_norm=BatchNorm2d)
+
+        self.pred = nn.Sequential(
+            nn.Conv2d(256, 1, 1, 1, padding=0, bias=False),
+            BatchNorm2d(1),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(1, 1, 1, 1, padding=0, bias=False)
+        )
+
+        self._initialize_weights()
+
+    def _build_layer(self, block, layer_setting, batch_norm, downsample=False):
+        t, p, c, n, s, d = layer_setting
+        input_channel = int(p * self.width_mult)
+        output_channel = int(c * self.width_mult)
+
+        layers = []
+        for i in range(n):
+            if i == 0:
+                d0 = d
+                if downsample:
+                    d0 = d // 2 if d > 1 else 1
+                layers.append(block(input_channel, output_channel, s, d0, expand_ratio=t, batch_norm=batch_norm))
+            else:
+                layers.append(block(input_channel, output_channel, 1, d, expand_ratio=t, batch_norm=batch_norm))
+            input_channel = output_channel
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # encode
+        l0 = self.layer0(x)
+        l1 = self.layer1(l0)
+        l2 = self.layer2(l1)
+        l3 = self.layer3(l2)
+        l4 = self.layer4(l3)
+        l5 = self.layer5(l4)
+        l6 = self.layer6(l5)
+        l7 = self.layer7(l6)
+
+        # pyramid pooling
+        l = self.dconv_pp(l7)
+
+        # decode
+        l = self.decoder(l, l2)
+
+        # prediction
+        l = self.pred(l)
+        l = F.interpolate(l, size=x.size()[2:], mode='bilinear', align_corners=True)
+
+        return l
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, SynchronizedBatchNorm2d):
+                m.eval()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+#######################################################################################
+# mobilenetv2_nrd
+#######################################################################################
+class MobileNetV2NRD(nn.Module):
+    def __init__(
+            self,
+            output_stride=16,
+            input_size=321,
+            width_mult=1.,
+            conv_operator='std_conv',
+            decoder_kernel_size=5,
+            apply_aspp=False,
+            freeze_bn=False,
+            sync_bn=False,
+            **kwargs
+    ):
+        super(MobileNetV2NRD, self).__init__()
+        self.width_mult = width_mult
+
+        BatchNorm2d = SynchronizedBatchNorm2d if sync_bn else nn.BatchNorm2d
+
+        block = InvertedResidual
+        decoder = nrd_trans_stage5
+        aspp = ASPP
+        initial_channel = 32
+        current_stride = 1
+        rate = 1
+        inverted_residual_setting = [
+            # t, p, c, n, s, d
+            [1, initial_channel, 16, 1, 1, 1],
+            [6, 16, 24, 2, 2, 1],
+            [6, 24, 32, 3, 2, 1],
+            [6, 32, 64, 4, 2, 1],
+            [6, 64, 96, 3, 1, 1],
+            [6, 96, 160, 3, 2, 1],
+            [6, 160, 320, 1, 1, 1],
+        ]
+
+        ### encoder ###
+        # building the first layer
+        # assert input_size % output_stride == 1
+        initial_channel = int(initial_channel * width_mult)
+        self.layer0 = conv_bn(4, initial_channel, 3, 2, BatchNorm2d)
+        current_stride *= 2
+        # building bottleneck layers
+        for i, setting in enumerate(inverted_residual_setting):
+            s = setting[4]
+            if current_stride == output_stride:
+                inverted_residual_setting[i][4] = 1  # change stride
+                rate *= s
+                inverted_residual_setting[i][5] = rate
+            else:
+                current_stride *= s
+        self.layer1 = self._build_layer(block, inverted_residual_setting[0], BatchNorm2d)
+        self.layer2 = self._build_layer(block, inverted_residual_setting[1], BatchNorm2d, downsample=True)
+        self.layer3 = self._build_layer(block, inverted_residual_setting[2], BatchNorm2d, downsample=True)
+        self.layer4 = self._build_layer(block, inverted_residual_setting[3], BatchNorm2d, downsample=True)
+        self.layer5 = self._build_layer(block, inverted_residual_setting[4], BatchNorm2d)
+        self.layer6 = self._build_layer(block, inverted_residual_setting[5], BatchNorm2d, downsample=True)
+        self.layer7 = self._build_layer(block, inverted_residual_setting[6], BatchNorm2d)
+
+        # freeze encoder batch norm layers
+        if freeze_bn:
+            self.freeze_bn()
+
+        ### context aggregation ###
+        # self.dconv_pp = aspp(320, 256, output_stride=output_stride, batch_norm=BatchNorm2d)
+
+        ### decoder ###
+        # self.decoder = decoder(conv_operator, decoder_kernel_size, batch_norm=BatchNorm2d)
+        self.decoder = decoder()
+
+        self.pred = nn.Sequential(
+            nn.Conv2d(256, 1, 1, 1, padding=0, bias=False),
+            BatchNorm2d(1),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(1, 1, 1, 1, padding=0, bias=False)
+        )
+
+        self._initialize_weights()
+
+    def _build_layer(self, block, layer_setting, batch_norm, downsample=False):
+        t, p, c, n, s, d = layer_setting
+        input_channel = int(p * self.width_mult)
+        output_channel = int(c * self.width_mult)
+
+        layers = []
+        for i in range(n):
+            if i == 0:
+                d0 = d
+                if downsample:
+                    d0 = d // 2 if d > 1 else 1
+                layers.append(block(input_channel, output_channel, s, d0, expand_ratio=t, batch_norm=batch_norm))
+            else:
+                layers.append(block(input_channel, output_channel, 1, d, expand_ratio=t, batch_norm=batch_norm))
+            input_channel = output_channel
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # encode
+        l0 = self.layer0(x)
+        l1 = self.layer1(l0)
+        l2 = self.layer2(l1)
+        l3 = self.layer3(l2)
+        l4 = self.layer4(l3)
+        l5 = self.layer5(l4)
+        l6 = self.layer6(l5)
+        l7 = self.layer7(l6)
+
+        nrd_input = [l2, l7]
+
+        # pyramid pooling
+        # l = self.dconv_pp(l7)
+
+        # decode
+        l = self.decoder(nrd_input)
+
+        # prediction
+        # l = self.pred(l)
+        # l = F.interpolate(l, size=x.size()[2:], mode='bilinear', align_corners=True)
+
+        return l
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, SynchronizedBatchNorm2d):
+                m.eval()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+
+#######################################################################################
+# mitb2_nrd
+#######################################################################################
+class MITB2_NRD(nn.Module):
+    def __init__(
+            self,
+            output_stride=16,
+            input_size=321,
+            width_mult=1.,
+            conv_operator='std_conv',
+            decoder_kernel_size=5,
+            apply_aspp=False,
+            freeze_bn=False,
+            sync_bn=False,
+            **kwargs
+    ):
+        super(MITB2_NRD, self).__init__()
+        # self.width_mult = width_mult
+
+        BatchNorm2d = SynchronizedBatchNorm2d if sync_bn else nn.BatchNorm2d
+
+        # block = InvertedResidual
+        # decoder = nrd_trans_stage5(in_channels=512,
+        #          c1_in_channels=64,
+        #          c1_channels=48)
+
+        MIT_B2_PTH = "/media/data/yifan/jinchao/code/gitcode/indexnet_matting/pretrained/mit_b2_new.pth"
+        ### encoder ###
+        self.encoder_modules = mit_b2(in_chans=4)
+        if self.training:
+            self.encoder_modules.init_weights(pretrained=MIT_B2_PTH)
+        # save mit_b2_new.pth
+        # pretrained_nrd_dict = torch.load(MIT_B2_PTH)
+        # model_nrd_dict = self.encoder_modules.state_dict()
+        # for name in pretrained_nrd_dict:
+        #     if name == "patch_embed1.proj.weight":
+        #         model_weight = model_nrd_dict[name]
+        #         assert model_weight.shape[1] == 4
+        #         model_weight[:, 0:3, :, :] = pretrained_nrd_dict[name]
+        #         model_weight[:, 3, :, :] = torch.tensor(0)
+        #         model_nrd_dict[name] = model_weight
+        #     else:
+        #         model_nrd_dict[name] = pretrained_nrd_dict[name]
+        # torch.save(model_nrd_dict, "/media/data/yifan/jinchao/code/gitcode/indexnet_matting/pretrained/mit_b2_new.pth")
+        # self.encoder_modules.load_state_dict(model_nrd_dict)
+
+        ### decoder ###
+        # self.decoder = decoder(conv_operator, decoder_kernel_size, batch_norm=BatchNorm2d)
+        self.decoder = nrd_trans_stage5(in_channels=512,
+                 c1_in_channels=64,
+                 c1_channels=48)
+
+        self.pred = nn.Sequential(
+            nn.Conv2d(256, 1, 1, 1, padding=0, bias=False),
+            BatchNorm2d(1),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(1, 1, 1, 1, padding=0, bias=False)
+        )
+
+        self._initialize_weights()
+
+    def _build_layer(self, block, layer_setting, batch_norm, downsample=False):
+        t, p, c, n, s, d = layer_setting
+        input_channel = int(p * self.width_mult)
+        output_channel = int(c * self.width_mult)
+
+        layers = []
+        for i in range(n):
+            if i == 0:
+                d0 = d
+                if downsample:
+                    d0 = d // 2 if d > 1 else 1
+                layers.append(block(input_channel, output_channel, s, d0, expand_ratio=t, batch_norm=batch_norm))
+            else:
+                layers.append(block(input_channel, output_channel, 1, d, expand_ratio=t, batch_norm=batch_norm))
+            input_channel = output_channel
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # encode
+        # l0 = self.layer0(x)
+        # l1 = self.layer1(l0)
+        # l2 = self.layer2(l1)
+        # l3 = self.layer3(l2)
+        # l4 = self.layer4(l3)
+        # l5 = self.layer5(l4)
+        # l6 = self.layer6(l5)
+        # l7 = self.layer7(l6)
+        #
+        # nrd_input = [l2, l7]
+
+        # pyramid pooling
+        # l = self.dconv_pp(l7)
+        input = self.encoder_modules(x)
+
+        # decode
+        l = self.decoder(input)
+
+        # prediction
+        # l = self.pred(l)
+        # l = F.interpolate(l, size=x.size()[2:], mode='bilinear', align_corners=True)
+
+        return l
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, SynchronizedBatchNorm2d):
+                m.eval()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+
+#######################################################################################
+# mitb0_nrd
+#######################################################################################
+class MITB0_NRD(nn.Module):
+    def __init__(
+            self,
+            output_stride=16,
+            input_size=321,
+            width_mult=1.,
+            conv_operator='std_conv',
+            decoder_kernel_size=5,
+            apply_aspp=False,
+            freeze_bn=False,
+            sync_bn=False,
+            **kwargs
+    ):
+        super(MITB0_NRD, self).__init__()
+        # self.width_mult = width_mult
+
+        BatchNorm2d = SynchronizedBatchNorm2d if sync_bn else nn.BatchNorm2d
+
+        # block = InvertedResidual
+        # decoder = nrd_trans_stage5(in_channels=256,
+        #          c1_in_channels=32,
+        #          c1_channels=16)
+
+        MIT_B0_PTH = "/media/data/yifan/jinchao/code/gitcode/indexnet_matting/pretrained/mit_b0_new.pth"
+        ### encoder ###
+        self.encoder_modules = mit_b0(in_chans=4)
+        if self.training:
+            self.encoder_modules.init_weights(pretrained=MIT_B0_PTH)
+
+        # # save mit_b2_new.pth
+        # pretrained_nrd_dict = torch.load(MIT_B0_PTH)
+        # model_nrd_dict = self.encoder_modules.state_dict()
+        # for name in pretrained_nrd_dict:
+        #     if name == "patch_embed1.proj.weight":
+        #         model_weight = model_nrd_dict[name]
+        #         assert model_weight.shape[1] == 4
+        #         model_weight[:, 0:3, :, :] = pretrained_nrd_dict[name]
+        #         model_weight[:, 3, :, :] = torch.tensor(0)
+        #         model_nrd_dict[name] = model_weight
+        #     else:
+        #         model_nrd_dict[name] = pretrained_nrd_dict[name]
+        # torch.save(model_nrd_dict, "/media/data/yifan/jinchao/code/gitcode/indexnet_matting/pretrained/mit_b0_new.pth")
+        # self.encoder_modules.load_state_dict(model_nrd_dict)
+
+        ### decoder ###
+        # self.decoder = decoder(conv_operator, decoder_kernel_size, batch_norm=BatchNorm2d)
+        self.decoder = nrd_trans_stage5(in_channels=256,
+                 c1_in_channels=32,
+                 c1_channels=16)
+
+        self.pred = nn.Sequential(
+            nn.Conv2d(256, 1, 1, 1, padding=0, bias=False),
+            BatchNorm2d(1),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(1, 1, 1, 1, padding=0, bias=False)
+        )
+
+        self._initialize_weights()
+
+    def _build_layer(self, block, layer_setting, batch_norm, downsample=False):
+        t, p, c, n, s, d = layer_setting
+        input_channel = int(p * self.width_mult)
+        output_channel = int(c * self.width_mult)
+
+        layers = []
+        for i in range(n):
+            if i == 0:
+                d0 = d
+                if downsample:
+                    d0 = d // 2 if d > 1 else 1
+                layers.append(block(input_channel, output_channel, s, d0, expand_ratio=t, batch_norm=batch_norm))
+            else:
+                layers.append(block(input_channel, output_channel, 1, d, expand_ratio=t, batch_norm=batch_norm))
+            input_channel = output_channel
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # encode
+        # l0 = self.layer0(x)
+        # l1 = self.layer1(l0)
+        # l2 = self.layer2(l1)
+        # l3 = self.layer3(l2)
+        # l4 = self.layer4(l3)
+        # l5 = self.layer5(l4)
+        # l6 = self.layer6(l5)
+        # l7 = self.layer7(l6)
+        #
+        # nrd_input = [l2, l7]
+
+        # pyramid pooling
+        # l = self.dconv_pp(l7)
+        input = self.encoder_modules(x)
+
+        # decode
+        l = self.decoder(input)
+
+        # prediction
+        # l = self.pred(l)
+        # l = F.interpolate(l, size=x.size()[2:], mode='bilinear', align_corners=True)
+
+        return l
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, SynchronizedBatchNorm2d):
+                m.eval()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                if m.bias is not None:
+                    m.bias.data.zero_()
+            elif isinstance(m, SynchronizedBatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+#######################################################################################
 # RefineNet B2
 #######################################################################################
 class CRPBlock(nn.Module):
@@ -715,7 +1263,7 @@ class hlMobileNetV2RefineNet(nn.Module):
         # prediction
         l = self.pred(l2)
         l = F.interpolate(l, size=x.size()[2:], mode='bilinear', align_corners=True)
-        
+
         return l
 
     def freeze_bn(self):
@@ -745,10 +1293,10 @@ class hlMobileNetV2RefineNet(nn.Module):
 #######################################################################################
 class hlMobileNetV2UNetDecoder(nn.Module):
     def __init__(
-        self, 
-        output_stride=32, 
-        input_size=320, 
-        width_mult=1., 
+        self,
+        output_stride=32,
+        input_size=320,
+        width_mult=1.,
         conv_operator='std_conv',
         decoder_kernel_size=5,
         apply_aspp=False,
@@ -802,7 +1350,7 @@ class hlMobileNetV2UNetDecoder(nn.Module):
         self.layer5 = self._build_layer(block, inverted_residual_setting[4], BatchNorm2d)
         self.layer6 = self._build_layer(block, inverted_residual_setting[5], BatchNorm2d, downsample=True)
         self.layer7 = self._build_layer(block, inverted_residual_setting[6], BatchNorm2d)
-        
+
         if output_stride == 32:
             self.pool0  = nn.MaxPool2d((2, 2), stride=2, padding=0, return_indices=True)
             self.pool2  = nn.MaxPool2d((2, 2), stride=2, padding=0, return_indices=True)
@@ -818,11 +1366,11 @@ class hlMobileNetV2UNetDecoder(nn.Module):
             self.pool0  = nn.MaxPool2d((2, 2), stride=2, padding=0, return_indices=True)
             self.pool2  = nn.MaxPool2d((2, 2), stride=2, padding=0, return_indices=True)
             self.pool3  = nn.MaxPool2d((2, 2), stride=2, padding=0, return_indices=True)
-            
+
         # freeze encoder batch norm layers
         if freeze_bn:
             self.freeze_bn()
-        
+
         ### context aggregation ###
         if apply_aspp:
             self.dconv_pp = aspp(int(320*width_mult), int(160*width_mult), output_stride=output_stride, batch_norm=BatchNorm2d, width_mult=width_mult)
@@ -882,7 +1430,7 @@ class hlMobileNetV2UNetDecoder(nn.Module):
         l1 = self.layer1(l0p)               # 16x160x160
         l2 = self.layer2(l1)                # 24x160x160
         l2p, idx2 = self.pool2(l2)          # 24x80x80
-        
+
         l3 = self.layer3(l2p)               # 32x80x80
         l3p, idx3 = self.pool3(l3)          # 32x40x40
 
@@ -906,7 +1454,7 @@ class hlMobileNetV2UNetDecoder(nn.Module):
 
         # pyramid pooling
         l = self.dconv_pp(l7)               # 160x10x10
-        
+
         # decode
         l = self.decoder_layer6(l, l6, idx6)
         l = self.decoder_layer5(l, l5)
@@ -947,10 +1495,10 @@ class hlMobileNetV2UNetDecoder(nn.Module):
 #######################################################################################
 class hlMobileNetV2UNetDecoderIndexLearning(nn.Module):
     def __init__(
-        self, 
-        output_stride=32, 
-        input_size=320, 
-        width_mult=1., 
+        self,
+        output_stride=32,
+        input_size=320,
+        width_mult=1.,
         conv_operator='std_conv',
         decoder_kernel_size=5,
         apply_aspp=False,
@@ -1040,7 +1588,7 @@ class hlMobileNetV2UNetDecoderIndexLearning(nn.Module):
             self.index4 = index_block(64, use_nonlinear=use_nonlinear, use_context=use_context, batch_norm=BatchNorm2d)
         else:
             raise NotImplementedError
-        
+
         ### context aggregation ###
         if apply_aspp:
             self.dconv_pp = aspp(320, 160, output_stride=output_stride, batch_norm=BatchNorm2d)
@@ -1097,9 +1645,9 @@ class hlMobileNetV2UNetDecoderIndexLearning(nn.Module):
         idx2_en, idx2_de = self.index2(l2)
         l2 = idx2_en * l2
         l2p = 4 * F.avg_pool2d(l2, (2, 2), stride=2)        # 24x80x80
-        
-        l3 = self.layer3(l2p)                               # 32x80x80       
-        idx3_en, idx3_de = self.index3(l3)  
+
+        l3 = self.layer3(l2p)                               # 32x80x80
+        idx3_en, idx3_de = self.index3(l3)
         l3 = idx3_en * l3
         l3p = 4 * F.avg_pool2d(l3, (2, 2), stride=2)        # 32x40x40
 
@@ -1155,7 +1703,7 @@ class hlMobileNetV2UNetDecoderIndexLearning(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
-                
+
 
 def hlmobilenetv2(pretrained=False, decoder='unet_style', **kwargs):
     """Constructs a MobileNet_V2 model.
@@ -1169,15 +1717,25 @@ def hlmobilenetv2(pretrained=False, decoder='unet_style', **kwargs):
         model = hlMobileNetV2UNetDecoderIndexLearning(**kwargs)
     elif decoder == 'deeplabv3+':
         model = MobileNetV2DeepLabv3Plus(**kwargs)
+    elif decoder == 'deeplabv3+_dilated':
+        model = MobileNetV2DeepLabv3Plus_dilated(**kwargs)
     elif decoder == 'refinenet':
         model = hlMobileNetV2RefineNet(**kwargs)
+    elif decoder == 'mobilenetv2_nrd':
+        model = MobileNetV2NRD(**kwargs)
+    elif decoder == 'mitb2_nrd_b2':
+        model = MITB2_NRD(**kwargs)
+    elif decoder == 'mitb2_nrd_b0':
+        model = MITB0_NRD(**kwargs)
     else:
         raise NotImplementedError
-    
+
     if pretrained:
         corresp_name = CORRESP_NAME
         model_dict = model.state_dict()
+
         pretrained_dict = load_url(model_urls['mobilenetv2'])
+
         for name in pretrained_dict:
             if name not in corresp_name:
                 continue
@@ -1206,27 +1764,35 @@ def load_url(url, model_dir='./pretrained', map_location=None):
     return torch.load(cached_file, map_location=map_location)
 
 
-if __name__ == "__main__":
-    import numpy as np
-
+def mobilenetv2_deeplabv3plus():
+    # import numpy as np
+    print('main')
     net = hlmobilenetv2(
         width_mult=1,
-        pretrained=True, 
-        freeze_bn=True, 
+        pretrained=True,
+        freeze_bn=True,
         sync_bn=False,
         apply_aspp=True,
         output_stride=32,
         conv_operator='std_conv',
         decoder_kernel_size=5,
-        decoder='unet_style',
+        decoder='deeplabv3+_dilated',# decoder choose in ['deeplabv3+_dilated','unet_style', 'deeplabv3+', 'refinenet', 'indexnet', 'mobilenetv2_nrd']
         indexnet='depthwise',
         index_mode='m2o',
         use_nonlinear=True,
-        use_context=True,
+        use_context=True
     )
+    # net = hlmobilenetv2(
+    #     pretrained=True,
+    #     decoder='nrd_stage5',
+    #     # decoder choose in ['unet_style', 'deeplabv3+', 'refinenet', 'indexnet', 'mobilenetv2_nrd']
+    #     num_classes=1
+    # )
+
     net.eval()
     net.cuda()
-
+    print(net)
+    #
     dump_x = torch.randn(1, 4, 224, 224).cuda()
     print(get_model_summary(net, dump_x))
 
@@ -1242,3 +1808,136 @@ if __name__ == "__main__":
         frame_rate[i] = running_frame_rate
     print(np.mean(frame_rate))
     print(y.shape)
+
+
+
+
+def mobilenetv2_nrd():
+    # import numpy as np
+    print('main')
+    net = hlmobilenetv2(
+        width_mult=1,
+        pretrained=False,
+        freeze_bn=True,
+        sync_bn=False,
+        apply_aspp=True,
+        output_stride=32,
+        conv_operator='std_conv',
+        decoder_kernel_size=5,
+        decoder='mitb2_nrd',
+        # decoder choose in ['unet_style', 'deeplabv3+', 'refinenet', 'indexnet', 'mobilenetv2_nrd', 'mitb2_nrd']
+        indexnet='depthwise',
+        index_mode='m2o',
+        use_nonlinear=True,
+        use_context=True
+    )
+
+    net.eval()
+    net.cuda()
+    print(net)
+    #
+    dump_x = torch.randn(16, 4, 320, 320).cuda()
+    print(get_model_summary(net, dump_x))
+
+    frame_rate = np.zeros((10, 1))
+    for i in range(10):
+        x = torch.randn(1, 4, 320, 320).cuda()
+        torch.cuda.synchronize()
+        start = time()
+        y = net(x)
+        torch.cuda.synchronize()
+        end = time()
+        running_frame_rate = 1 * float(1 / (end - start))
+        frame_rate[i] = running_frame_rate
+    print(np.mean(frame_rate))
+    print(y.shape)
+
+
+def mobilenetv2_nrd():
+    # import numpy as np
+    print('main')
+    net = hlmobilenetv2(
+        width_mult=1,
+        pretrained=False,
+        freeze_bn=True,
+        sync_bn=False,
+        apply_aspp=True,
+        output_stride=32,
+        conv_operator='std_conv',
+        decoder_kernel_size=5,
+        decoder='mitb2_nrd',
+        # decoder choose in ['unet_style', 'deeplabv3+', 'refinenet', 'indexnet', 'mobilenetv2_nrd', 'mitb2_nrd']
+        indexnet='depthwise',
+        index_mode='m2o',
+        use_nonlinear=True,
+        use_context=True
+    )
+
+    net.eval()
+    net.cuda()
+    print(net)
+    #
+    dump_x = torch.randn(16, 4, 320, 320).cuda()
+    print(get_model_summary(net, dump_x))
+
+    frame_rate = np.zeros((10, 1))
+    for i in range(10):
+        x = torch.randn(1, 4, 320, 320).cuda()
+        torch.cuda.synchronize()
+        start = time()
+        y = net(x)
+        torch.cuda.synchronize()
+        end = time()
+        running_frame_rate = 1 * float(1 / (end - start))
+        frame_rate[i] = running_frame_rate
+    print(np.mean(frame_rate))
+    print(y.shape)
+
+
+def mobilenetv2_nrd_b0():
+    # import numpy as np
+    print('main')
+    net = hlmobilenetv2(
+        width_mult=1,
+        pretrained=False,
+        freeze_bn=True,
+        sync_bn=False,
+        apply_aspp=True,
+        output_stride=32,
+        conv_operator='std_conv',
+        decoder_kernel_size=5,
+        decoder='mitb2_nrd_b0',
+        # decoder choose in ['mitb2_nrd_b0', 'mobilenetv2_nrd', 'mitb2_nrd_b2', 'unet_style', 'deeplabv3+', 'refinenet', 'indexnet']
+        indexnet='depthwise',
+        index_mode='m2o',
+        use_nonlinear=True,
+        use_context=True
+    )
+
+    net.eval()
+    net.cuda()
+    print(net)
+    #
+    dump_x = torch.randn(16, 4, 320, 320).cuda()
+    print(get_model_summary(net, dump_x))
+
+    frame_rate = np.zeros((10, 1))
+    for i in range(10):
+        x = torch.randn(1, 4, 320, 320).cuda()
+        torch.cuda.synchronize()
+        start = time()
+        y = net(x)
+        torch.cuda.synchronize()
+        end = time()
+        running_frame_rate = 1 * float(1 / (end - start))
+        frame_rate[i] = running_frame_rate
+    print(np.mean(frame_rate))
+    print(y.shape)
+
+
+
+if __name__ == "__main__":
+    import numpy as np
+    print('main')
+    mobilenetv2_deeplabv3plus()
+    # mobilenetv2_nrd_b0()
